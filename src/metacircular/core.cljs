@@ -1,20 +1,28 @@
-(ns ^:figwheel-always metacircular.core
-    (:require))
+(ns metacircular.core)
 
 (enable-console-print!)
 
-(println "Edits to this text should show up in your developer console.")
-
 (defn function? [x]
-  (js* "typeof(x) === 'function';"))
+  (goog/isFunction x))
 
-(declare eval eval-fn eval-unquote)
+(defn cont-trampoline
+  ([f]
+   (if (and (fn? f) (get (meta f) :continuation))
+     (recur (f))
+     f))
+  ([f & args]
+   (cont-trampoline (apply f args))))
+
+(declare eval-k eval-fn eval-seq eval-do eval-breakpoint)
+
+(defonce debugger-state (atom {}))
 
 (def initial-env-map
-  (atom { 'println (atom println)
-          '+       (atom +)
-          'fn      (atom (list 'syntax-primitive eval-fn))
-   }))
+  (atom { 'println    (atom println)
+          '+          (atom +)
+          'do         (atom (list 'syntax-primitive eval-do))
+          'fn         (atom (list 'syntax-primitive eval-fn))
+          'breakpoint (atom (list 'syntax-primitive eval-breakpoint)) }))
 
 (def var? symbol?)
 
@@ -54,17 +62,36 @@
            (function? (first xs))
            (= ((first xs)) (initial tag)))))
 
-(defn eval-fn [exp env]
+(defn eval-fn [exp env k]
   (let [arg-decl (first (rest exp))]
-    (fn [& args]
-      (eval
-       (first (rest (rest exp)))
-       ;; this is not a do exp should be
-       (env-extend* env arg-decl args)))))
+    (k
+     (with-meta
+       (fn [args k']
+         (eval-seq
+          (rest (rest exp))
+          ;; this is not a do exp should be
+          (env-extend* env arg-decl args)
+          k'))
+       {:lambda true}))))
 
-(defn eval-unquote [exp env]
-  (eval (first (rest exp))
-        env))
+(defn eval-breakpoint [exp env k]
+  (reset! debugger-state { :env          env
+                           :continuation k})
+  (println "Entering debugger"))
+
+(defn continue! []
+  (swap! debugger-state dissoc :stepping)
+  (cont-trampoline ((:continuation @debugger-state) nil)))
+
+(defn p! [v]
+  {:pre [(var? v)]}
+  (env-lookup (:env @debugger-state) v))
+
+;; TODO this is not implemented yet
+(defn step! [v]
+  {:pre [(var? v)]}
+  (swap! debugger-state assoc :stepping true)
+  (cont-trampoline ((:continuation @debugger-state) nil)))
 
 ;; define your app data so that it doesn't get over-written on reload
 
@@ -76,21 +103,31 @@
 (def app->fun first)
 (def app->args rest)
 
-(declare perform-apply)
+(declare perform-apply-k)
+
+(defn continuation [k]
+  (fn [x]
+    (with-meta (fn [] (k x)) {:continuation true})))
+
+(defn eval-k [exp env k]
+  (let [k (continuation k)]
+    (cond
+      (symbol? exp) (k (env-lookup env exp))
+      (string? exp) (k exp)
+      (number? exp) (k exp)
+      ;; used for boxing 3d constructs and atom would work as well
+      (function? exp) (k (exp))
+      (app? exp)
+      (eval-k (app->fun exp)
+              env
+              (fn [res]
+                (perform-apply-k res
+                                 exp env k)))
+      :else
+      (throw "RE: Unkown expression type"))))
 
 (defn eval [exp env]
-  (prn exp)
-  (cond
-    (symbol? exp) (env-lookup env exp)
-    (string? exp) exp
-    (number? exp) exp
-    ;; used for boxing 3d constructs and atom would work as well
-    (function? exp) (exp)
-    (app? exp)
-    (perform-apply (eval (app->fun exp) env)
-                     exp env)
-    :else
-    (throw "RE: Unkown expression type")))
+  (cont-trampoline eval-k exp env identity))
 
 (defn syntax-primitive? [x] (d-tagged-list? 'syntax-primitive x))
 (def syntax-primitive->eval (comp first rest))
@@ -98,35 +135,59 @@
 (defn macro? [x] (d-tagged-list? 'macro x))
 (def macro->proc (comp first rest))
 
-(defn perform-apply [fun app-exp env]
-  (prn "apply" fun)
+(defn lambda? [x] (get (meta x) :lambda))
+
+(defn eval-args [args env k]
+  (if (empty? args)
+    (k '())
+    (eval-k (first args)
+            env
+            (fn [a]
+              (eval-args (rest args) env (fn [x] (k (cons a x))))))))
+
+(defn eval-seq [exps env k]
+  (eval-args exps env (fn [vals'] (k (last vals')))))
+
+(defn eval-do [exp env k]
+  (eval-seq (rest exp) env k))
+
+(defn perform-apply-k [fun app-exp env k]
+  (prn "apply" (if (seq? fun) (first fun) nil))
   (let [args (app->args app-exp)]
     (cond
       (syntax-primitive? fun) ((syntax-primitive->eval fun)
-                               app-exp env)
-      (macro? fun) (eval (apply (macro->proc fun) args) env)
-      :else (apply fun (map #(eval % env) args)))))
-
-
-
+                               app-exp env k)
+      (macro? fun) (eval-k (apply (macro->proc fun) args) env k)
+      (lambda? fun) (apply fun [args k])
+      :else (eval-args args env (fn [args']
+                                  (k (apply fun args')))))))
 
 (comment
   (def x (atom {'a (atom 5)}))
   
   (env-set! x 'a 6)
+  
   (env-lookup x 'b)
   (env-lookup x 'a)  
-  
+
   (eval 'a (atom {'a (atom 5)}))
   (eval "hi" (atom {}))
   (eval 2 (atom {}))
-  
+ 
   (eval (fn [] "hey") (atom {}))
 
   (eval '(println "hello world") initial-env-map)
   (eval '(+ 1 2 3 (+ 4 5)) initial-env-map)
   (eval '((fn [x] x) 5) initial-env-map)
+  (eval '((fn [x y] (+ x y)) 5 7) initial-env-map)  
 
+  (eval '(do 1 2 3 (+ 1 2 (+ 7 8))) initial-env-map)
+  (eval '(do 1) initial-env-map)
+
+  (eval '((fn [x y] 4 (+ x y)) 5 7) initial-env-map)
+
+  (eval '((fn [x y] 4 (breakpoint) (+ x y)) 5 7) initial-env-map)
+  
   ;; syntax primitive macro
   (env-set! initial-env-map
             'by-five
@@ -137,4 +198,3 @@
   (eval '(+ 1 (by-five (+ 1 3))) initial-env-map)
   
   )
-
