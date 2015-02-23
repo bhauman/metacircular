@@ -74,24 +74,33 @@
           k'))
        {:lambda true}))))
 
+(defn enter-stepper [exp env k]
+  (swap! debugger-state
+         assoc
+         :exp exp
+         :env env
+         :continuation k)
+  (prn exp))
+
+(defn leave-stepper []
+  (println "leaving stepper")
+  (swap! debugger-state dissoc :stepping))
+
 (defn eval-breakpoint [exp env k]
-  (reset! debugger-state { :env          env
-                           :continuation k})
+  (enter-stepper exp env k)
   (println "Entering debugger"))
 
 (defn continue! []
-  (swap! debugger-state dissoc :stepping)
+  (leave-stepper)
   (cont-trampoline ((:continuation @debugger-state) nil)))
 
 (defn p! [v]
   {:pre [(var? v)]}
   (env-lookup (:env @debugger-state) v))
 
-;; TODO this is not implemented yet
-(defn step! [v]
-  {:pre [(var? v)]}
+(defn step! []
   (swap! debugger-state assoc :stepping true)
-  (cont-trampoline ((:continuation @debugger-state) nil)))
+  (cont-trampoline ((:continuation @debugger-state))))
 
 ;; define your app data so that it doesn't get over-written on reload
 
@@ -110,21 +119,29 @@
     (with-meta (fn [] (k x)) {:continuation true})))
 
 (defn eval-k [exp env k]
-  (let [k (continuation k)]
-    (cond
-      (symbol? exp) (k (env-lookup env exp))
-      (string? exp) (k exp)
-      (number? exp) (k exp)
-      ;; used for boxing 3d constructs and atom would work as well
-      (function? exp) (k (exp))
-      (app? exp)
-      (eval-k (app->fun exp)
-              env
-              (fn [res]
-                (perform-apply-k res
-                                 exp env k)))
-      :else
-      (throw "RE: Unkown expression type"))))
+  (let [k (continuation k)
+        next-step
+        (cond
+          (symbol? exp) (k (env-lookup env exp))
+          (string? exp) (k exp)
+          (number? exp) (k exp)
+          ;; used for boxing 3d constructs and atom would work as well
+          (function? exp) (k (exp))
+          (app? exp)
+          (eval-k (app->fun exp)
+                  env
+                  (fn [res]
+                    (perform-apply-k res
+                                     exp env k)))
+          :else
+          (throw "RE: Unkown expression type"))]
+    (if-not (:continuation (meta next-step))
+      (do
+        (leave-stepper)
+        next-step)
+      (if (:stepping @debugger-state)
+        (enter-stepper exp env next-step)
+        next-step))))
 
 (defn eval [exp env]
   (cont-trampoline eval-k exp env identity))
@@ -162,6 +179,7 @@
       :else (eval-args args env (fn [args']
                                   (k (apply fun args')))))))
 
+
 (comment
   (def x (atom {'a (atom 5)}))
   
@@ -179,6 +197,8 @@
   (eval '(println "hello world") initial-env-map)
   (eval '(+ 1 2 3 (+ 4 5)) initial-env-map)
   (eval '((fn [x] x) 5) initial-env-map)
+  
+  
   (eval '((fn [x y] (+ x y)) 5 7) initial-env-map)  
 
   (eval '(do 1 2 3 (+ 1 2 (+ 7 8))) initial-env-map)
